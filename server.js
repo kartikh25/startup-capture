@@ -7,15 +7,7 @@ import { google } from "googleapis";
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-const MODELS = [
-  "gemini-2.5-flash-lite",
-  "gemini-3.5-flash-lite",
-  "gemini-3.5-flash",
-  "gemini-2.0-flash-lite",
-];
-
 const jobs = new Map();
-
 app.use(cors());
 app.use(express.json({ limit: "15mb" }));
 
@@ -26,7 +18,6 @@ function parseGoogleCredentials() {
   if (text.startsWith('"') && text.endsWith('"')) {
     try { text = JSON.parse(text); } catch { /* keep */ }
   }
-  text = String(text).trim();
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start === -1) throw new Error("Google JSON invalid");
@@ -40,8 +31,41 @@ function googleJsonOk() {
   } catch { return false; }
 }
 
+function getAnthropicConfig() {
+  const rawBase = (process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com").replace(/\/$/, "");
+  const isMcKinsey = rawBase.includes("quantumblack.com");
+  const messagesUrl = rawBase.endsWith("/v1")
+    ? `${rawBase}/messages`
+    : `${rawBase}/v1/messages`;
+  return { messagesUrl, isMcKinsey, rawBase };
+}
+
+function researchEngine() {
+  if (process.env.ANTHROPIC_API_KEY) return "claude";
+  if (process.env.PERPLEXITY_API_KEY) return "perplexity";
+  return "none";
+}
+
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, services: { gemini: !!process.env.GEMINI_API_KEY, googleSheets: googleJsonOk() } });
+  const engine = researchEngine();
+  const { isMcKinsey } = getAnthropicConfig();
+  res.json({
+    ok: true,
+    services: {
+      claude: !!process.env.ANTHROPIC_API_KEY,
+      perplexity: !!process.env.PERPLEXITY_API_KEY,
+      googleSheets: googleJsonOk(),
+    },
+    engine,
+    gateway: isMcKinsey ? "mckinsey-quantumblack" : "anthropic-public",
+    quality: engine === "claude"
+      ? isMcKinsey
+        ? "high (McKinsey Claude + web search)"
+        : "high (Claude + web search)"
+      : engine === "perplexity"
+        ? "high (Perplexity web research)"
+        : "add ANTHROPIC_API_KEY in Render",
+  });
 });
 
 function extractJson(text) {
@@ -49,8 +73,15 @@ function extractJson(text) {
   const raw = fenced ? fenced[1].trim() : String(text).trim();
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
-  if (start === -1) throw new Error("AI bad format");
+  if (start === -1) throw new Error("AI returned invalid JSON");
   return JSON.parse(raw.slice(start, end + 1));
+}
+
+function extractTextFromAnthropic(data) {
+  const blocks = data.content || [];
+  const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  if (!text) throw new Error("Claude returned no text");
+  return text;
 }
 
 function sanitizeSheetId(input) {
@@ -63,9 +94,13 @@ function norm(h) {
   return (h || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function identifyStartupName(capture) {
+function extractIdentity(capture) {
   const pc = capture.pageContext || {};
-  return pc.companyNameHint || pc.title?.split("|")[0]?.split("-")[0]?.trim() || "Unknown Startup";
+  const url = pc.url || "";
+  const linkedinMatch = url.match(/linkedin\.com\/company\/([^/?#]+)/i);
+  const slug = linkedinMatch?.[1] || "";
+  const name = pc.companyNameHint || pc.title?.split("|")[0]?.split("-")[0]?.trim() || slug || "Unknown";
+  return { name, url, slug };
 }
 
 function getSheetsClient() {
@@ -82,23 +117,18 @@ async function getSheetHeaders(sheetId) {
   return res.data.values?.[0]?.filter((h) => h && String(h).trim()) || [];
 }
 
-// Maps normalized header → value from record
 function resolveCell(header, data) {
   const h = norm(header);
   const { record, capturedAt, sourceUrl } = data;
-
-  // Direct extraFields match (exact header from sheet)
   if (record.extraFields?.[header]) return record.extraFields[header];
-  if (record.extraFields?.[h]) return record.extraFields[h];
 
-  const aliases = {
+  const map = {
     "captured at": capturedAt,
     "startup name": record.startupName,
     "source url": sourceUrl,
     "screenshot link": "n/a",
     "what is the company building": record.keyProducts || record.whatIsTheCompanyBuilding,
     "what is the company building?": record.keyProducts || record.whatIsTheCompanyBuilding,
-    "company building": record.keyProducts,
     "founding year": record.foundingYear,
     "founders": record.founders,
     "founder background": record.founderBackground,
@@ -106,89 +136,44 @@ function resolveCell(header, data) {
     "funding raised": record.fundingRaised,
     "valuation": record.valuation,
     "arr / revenue": record.arrRevenue,
-    "arr/revenue": record.arrRevenue,
-    "revenue": record.arrRevenue,
     "key products": record.keyProducts,
     "investment thesis": record.investmentThesis,
     "why they stand out": record.whyTheyStandOut,
     "competitors (startups)": record.competitorsStartups,
-    "competitors startups": record.competitorsStartups,
     "competitors (incumbents)": record.competitorsIncumbents,
-    "competitors incumbents": record.competitorsIncumbents,
     "relevant links": record.relevantLinks,
     "confidence / notes": record.confidenceNotes,
-    "confidence notes": record.confidenceNotes,
-    "job status": record.jobStatus || "completed",
+    "job status": record.jobStatus || "needs_review",
   };
-
-  if (aliases[h] != null && aliases[h] !== "") return aliases[h];
-  return record.extraFields?.[header] ?? "";
+  return map[h] ?? "";
 }
 
 function buildRow(headers, data) {
-  return headers.map((header) => {
-    const val = resolveCell(header, data);
-    return val == null ? "" : String(val);
+  return headers.map((h) => {
+    const v = resolveCell(h, data);
+    return v == null ? "" : String(v);
   });
 }
 
-async function callGemini(prompt) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("GEMINI_API_KEY not set");
+function buildResearchPrompt(identity, sheetHeaders, searchContext) {
+  const customCols = sheetHeaders.filter((h) => {
+    const known = ["captured at","startup name","source url","screenshot link","founding year",
+      "founders","founder background","right to win","funding raised","valuation",
+      "arr / revenue","key products","investment thesis","why they stand out",
+      "competitors (startups)","competitors (incumbents)","relevant links",
+      "confidence / notes","job status","what is the company building","what is the company building?"];
+    return !known.includes(norm(h));
+  });
 
-  let lastErr;
-  for (const model of MODELS) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      for (const useSearch of [true, false]) {
-        try {
-          const body = {
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
-          };
-          if (useSearch) body.tools = [{ google_search: {} }];
+  return `You are a senior VC analyst at a top-tier fund. Produce an investment thesis dossier.
 
-          const res = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-            { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-          );
-          const data = await res.json();
-          if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+${identity.slug ? `CRITICAL IDENTITY LOCK: This is the company with LinkedIn slug "${identity.slug}" at ${identity.url}. Do NOT confuse with other companies named "${identity.name}".` : `Company: "${identity.name}" from ${identity.url}`}
 
-          const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("\n");
-          if (!text) throw new Error("Empty response");
-          console.log(`OK: ${model} search=${useSearch}`);
-          return text;
-        } catch (err) {
-          lastErr = err;
-          if (/503|429|404|not found|high demand|overload/i.test(err.message || "")) {
-            await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
-          }
-        }
-      }
-    }
-  }
-  throw lastErr || new Error("AI failed");
-}
+${searchContext ? `WEB SEARCH RESULTS (use ONLY these facts — do not invent anything beyond them):\n${searchContext}\n` : "Research thoroughly. Check: company website, Crunchbase, LinkedIn, TechCrunch, PitchBook news, founder interviews, press releases."}
 
-async function runWebResearch(startupName, sourceUrl, sheetHeaders) {
-  const headerList = sheetHeaders.map((h) => `"${h}"`).join(", ");
-
-  const prompt = `You are a senior VC analyst. Research startup "${startupName}" thoroughly using Google Search.
-
-Trigger URL (hint only): ${sourceUrl}
-
-SEARCH THE WEB for:
-- Company website, Crunchbase, TechCrunch, LinkedIn, press releases
-- Founders names, backgrounds, LinkedIn career history
-- All funding rounds, investors, valuation
-- Revenue/ARR if public
-- Product description, what they build
-- Competitors (startups + incumbents)
-- Investment thesis: why fundable?
-
-Return ONLY this JSON:
+Return ONLY valid JSON:
 {
-  "startupName": "${startupName}",
+  "startupName": "${identity.name}",
   "foundingYear": "",
   "founders": "",
   "founderBackground": "",
@@ -208,41 +193,231 @@ Return ONLY this JSON:
   "extraFields": {}
 }
 
-CRITICAL RULES:
-- DO REAL WEB RESEARCH. Do NOT write "Unknown" unless you searched and found nothing.
-- If not public: write "Not publicly disclosed" NOT "Unknown"
-- If estimated: write "$50M (estimated)" format
-- founders: actual names from search
-- founderBackground: 2-3 sentences on career
-- rightToWin: why founders can win this market
-- fundingRaised: "$X Series A led by Y" format
-- investmentThesis: 2-3 compelling sentences
-- keyProducts AND whatIsTheCompanyBuilding: detailed product description
-- relevantLinks: comma-separated URLs you used
-- extraFields: fill ANY of these sheet columns not covered above, using EXACT column names as keys:
-  ${headerList}
+FIELD GUIDELINES:
+- founders: full names, comma-separated
+- founderBackground: education + career highlights (2-3 sentences)
+- rightToWin: why THESE founders win in THIS market based on track record
+- fundingRaised: all rounds with amounts and lead investors e.g. "$12M Series A led by Sequoia (2024)"
+- valuation: latest known, mark (estimated) if not confirmed
+- arrRevenue: best available metric, mark (estimated) if needed
+- keyProducts + whatIsTheCompanyBuilding: detailed product description
+- investmentThesis: 2-3 sentence compelling VC investment case
+- whyTheyStandOut: specific differentiation and traction signals
+- competitorsStartups: direct startup competitors, comma-separated
+- competitorsIncumbents: established players, comma-separated
+- relevantLinks: comma-separated source URLs used
+- confidenceNotes: what is verified vs estimated, any conflicts between sources
+- jobStatus: "needs_review" if >2 key fields are estimated; else "completed"
+${customCols.length ? `- extraFields: fill these custom columns with exact keys: ${customCols.map((c) => `"${c}"`).join(", ")}` : ""}
 
-jobStatus = "needs_review" only if most financial data is estimated.
+Never invent data. If a field is not in search results, write "Not found in search".`;
+}
 
-Return ONLY valid JSON.`;
+async function duckDuckGoSearch(query) {
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; StartupCapture/1.0)" },
+    });
+    if (!res.ok) return [];
+    const html = await res.text();
+    const results = [];
+    const blocks = html.split('class="result__body"');
+    for (const block of blocks.slice(1, 6)) {
+      const titleMatch = block.match(/class="result__a"[^>]*>([^<]+)/);
+      const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
+      const linkMatch = block.match(/class="result__url"[^>]*>([^<]+)/);
+      if (titleMatch) {
+        results.push({
+          title: titleMatch[1].trim(),
+          snippet: snippetMatch ? snippetMatch[1].replace(/<[^>]+>/g, "").trim() : "",
+          url: linkMatch ? linkMatch[1].trim() : "",
+        });
+      }
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
 
-  const raw = await callGemini(prompt);
-  const record = extractJson(raw);
+async function gatherSearchContext(identity) {
+  const queries = [
+    `${identity.name} startup founders funding crunchbase`,
+    `${identity.slug || identity.name} series funding investors`,
+    `${identity.name} company product what they build`,
+    `${identity.name} competitors market`,
+  ];
+
+  const all = [];
+  for (const q of queries) {
+    const hits = await duckDuckGoSearch(q);
+    all.push(...hits);
+  }
+
+  const seen = new Set();
+  const unique = all.filter((r) => {
+    const key = r.title + r.url;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return unique.slice(0, 20).map((r, i) =>
+    `[${i + 1}] ${r.title}\nURL: ${r.url}\n${r.snippet}`
+  ).join("\n\n");
+}
+
+async function callClaude(messagesUrl, key, body) {
+  const res = await fetch(messagesUrl, {
+    method: "POST",
+    headers: {
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  return { ok: res.ok, status: res.status, data: res.ok ? await res.json() : null, err: res.ok ? "" : await res.text() };
+}
+
+async function researchWithClaude(prompt, identity) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) throw new Error("ANTHROPIC_API_KEY not set");
+
+  const { messagesUrl, isMcKinsey } = getAnthropicConfig();
+  const models = [
+    "claude-sonnet-4-20250514",
+    "claude-3-7-sonnet-latest",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-sonnet-latest",
+  ];
+
+  let searchContext = "";
+  if (isMcKinsey) {
+    searchContext = await gatherSearchContext(identity);
+  }
+
+  const fullPrompt = isMcKinsey
+    ? buildResearchPrompt(identity, [], searchContext)
+    : prompt;
+
+  let lastErr = "";
+
+  for (const model of models) {
+    // McKinsey gateway: web search tool not supported — use DDG + Claude
+    const body = isMcKinsey
+      ? { model, max_tokens: 4096, temperature: 0.1, messages: [{ role: "user", content: fullPrompt }] }
+      : {
+          model, max_tokens: 4096, temperature: 0.1,
+          tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }],
+          messages: [{ role: "user", content: fullPrompt }],
+        };
+
+    let result = await callClaude(messagesUrl, key, body);
+
+    // If web search tool rejected, retry without it + DDG context
+    if (!result.ok && !isMcKinsey && (result.err.includes("tool") || result.err.includes("web_search"))) {
+      searchContext = await gatherSearchContext(identity);
+      const fallbackPrompt = buildResearchPrompt(identity, [], searchContext);
+      result = await callClaude(messagesUrl, key, {
+        model, max_tokens: 4096, temperature: 0.1,
+        messages: [{ role: "user", content: fallbackPrompt }],
+      });
+    }
+
+    if (!result.ok) {
+      lastErr = result.err;
+      if (lastErr.includes("model") || lastErr.includes("not_found") || result.status === 404) continue;
+      throw new Error(`Claude error: ${lastErr}`);
+    }
+
+    const record = extractJson(extractTextFromAnthropic(result.data));
+    const cited = (result.data.content || [])
+      .flatMap((b) => b.citations || [])
+      .map((c) => c.url)
+      .filter(Boolean);
+    if (cited.length) {
+      record.relevantLinks = [...new Set([...(record.relevantLinks || "").split(",").map((s) => s.trim()), ...cited])]
+        .filter(Boolean).slice(0, 12).join(", ");
+    }
+    return record;
+  }
+
+  throw new Error(`Claude error: ${lastErr || "all models failed — check ANTHROPIC_BASE_URL and token expiry"}`);
+}
+
+async function researchWithPerplexity(prompt) {
+  const key = process.env.PERPLEXITY_API_KEY;
+  if (!key) throw new Error("PERPLEXITY_API_KEY not set");
+
+  const res = await fetch("https://api.perplexity.ai/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "sonar-pro",
+      messages: [
+        { role: "system", content: "Expert VC analyst. Web search only. Return valid JSON." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.1,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    const res2 = await fetch("https://api.perplexity.ai/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "sonar",
+        messages: [
+          { role: "system", content: "Expert VC analyst. Web search only. Return valid JSON." },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.1,
+      }),
+    });
+    if (!res2.ok) throw new Error(`Perplexity error: ${err}`);
+    const data2 = await res2.json();
+    const record = extractJson(data2.choices[0].message.content);
+    if (data2.citations?.length) record.relevantLinks = data2.citations.slice(0, 10).join(", ");
+    return record;
+  }
+
+  const data = await res.json();
+  const record = extractJson(data.choices[0].message.content);
+  if (data.citations?.length) {
+    record.relevantLinks = [...new Set([...(record.relevantLinks || "").split(","), ...data.citations])]
+      .filter(Boolean).slice(0, 12).join(", ");
+  }
+  return record;
+}
+
+async function runWebResearch(identity, sheetHeaders) {
+  const prompt = buildResearchPrompt(identity, sheetHeaders);
+  const engine = researchEngine();
+  const record = engine === "claude"
+    ? await researchWithClaude(prompt, identity)
+    : await researchWithPerplexity(prompt);
+
   record.extraFields = record.extraFields || {};
+  record.startupName = record.startupName || identity.name;
   if (!record.whatIsTheCompanyBuilding) record.whatIsTheCompanyBuilding = record.keyProducts;
   if (!record.keyProducts) record.keyProducts = record.whatIsTheCompanyBuilding;
+
+  const sparse = !record.founders || !record.fundingRaised;
+  if (sparse) record.jobStatus = "needs_review";
+
   return record;
 }
 
 async function appendToSheet(sheetId, data) {
   const sheets = getSheetsClient();
   const headers = await getSheetHeaders(sheetId);
-  if (!headers.length) throw new Error("Sheet has no headers in row 1");
+  if (!headers.length) throw new Error("Row 1 must have column headers");
 
   const row = buildRow(headers, data);
-  console.log("Headers:", headers);
-  console.log("Row:", row);
-
   const response = await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
     range: "Sheet1!A:ZZ",
@@ -252,24 +427,28 @@ async function appendToSheet(sheetId, data) {
   });
 
   const rowMatch = (response.data.updates?.updatedRange || "").match(/(\d+)$/);
-  const rowNumber = rowMatch ? parseInt(rowMatch[1], 10) : 0;
-  return { sheetUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/edit#gid=0&range=A${rowNumber}` };
+  return {
+    sheetUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/edit#gid=0&range=A${rowMatch ? rowMatch[1] : 1}`,
+  };
 }
 
 async function processJob(jobId, capture, sheetId) {
   try {
-    const startupName = identifyStartupName(capture);
+    const identity = extractIdentity(capture);
     const headers = await getSheetHeaders(sheetId);
 
-    jobs.set(jobId, { id: jobId, status: "processing", progress: `Researching ${startupName}...`, startupName });
+    jobs.set(jobId, {
+      id: jobId, status: "processing",
+      progress: `Deep research on ${identity.name}...`,
+      startupName: identity.name,
+    });
 
-    const record = await runWebResearch(startupName, capture.pageContext?.url || "", headers);
+    const record = await runWebResearch(identity, headers);
 
-    jobs.set(jobId, { ...jobs.get(jobId), progress: "Saving..." });
-
+    jobs.set(jobId, { ...jobs.get(jobId), progress: "Saving to sheet..." });
     const { sheetUrl } = await appendToSheet(sheetId, {
       capturedAt: capture.capturedAt,
-      sourceUrl: capture.pageContext?.url || "",
+      sourceUrl: identity.url,
       record,
     });
 
@@ -281,7 +460,6 @@ async function processJob(jobId, capture, sheetId) {
       progress: "Done",
     });
   } catch (err) {
-    console.error("Job failed:", err);
     jobs.set(jobId, { id: jobId, status: "failed", error: err.message });
   }
 }
@@ -289,7 +467,7 @@ async function processJob(jobId, capture, sheetId) {
 app.post("/api/capture", (req, res) => {
   const body = req.body;
   if (!body.pageContext?.companyNameHint && !body.pageContext?.title) {
-    return res.status(400).json({ error: "Could not identify startup name" });
+    return res.status(400).json({ error: "Could not identify startup" });
   }
   const sheetId = sanitizeSheetId(body.sheetId || process.env.GOOGLE_SHEET_ID);
   if (!sheetId) return res.status(400).json({ error: "No Sheet ID" });
