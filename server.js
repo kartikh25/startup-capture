@@ -14,23 +14,6 @@ const MODELS = [
   "gemini-2.0-flash-lite",
 ];
 
-const DEFAULT_HEADERS = [
-  "Captured At", "Startup Name", "Source URL", "Screenshot Link",
-  "Founding Year", "Founders", "Founder Background", "Right to Win",
-  "Funding Raised", "Valuation", "ARR / Revenue", "Key Products",
-  "Investment Thesis", "Why They Stand Out", "Competitors (Startups)",
-  "Competitors (Incumbents)", "Relevant Links", "Confidence / Notes", "Job Status",
-];
-
-const RESEARCH_QUERIES = (name) => [
-  `"${name}" startup founders CEO background LinkedIn`,
-  `"${name}" funding raised valuation investors crunchbase`,
-  `"${name}" revenue ARR annual recurring revenue`,
-  `"${name}" product what does company do`,
-  `"${name}" competitors market landscape alternatives`,
-  `"${name}" startup news investment`,
-];
-
 const jobs = new Map();
 
 app.use(cors());
@@ -38,7 +21,7 @@ app.use(express.json({ limit: "15mb" }));
 
 function parseGoogleCredentials() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON not set on Render");
+  if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON not set");
   let text = String(raw).trim();
   if (text.startsWith('"') && text.endsWith('"')) {
     try { text = JSON.parse(text); } catch { /* keep */ }
@@ -46,25 +29,19 @@ function parseGoogleCredentials() {
   text = String(text).trim();
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
-  if (start === -1) throw new Error("Google JSON invalid — re-paste in Render");
-  try {
-    const creds = JSON.parse(text.slice(start, end + 1));
-    if (!creds.client_email || !creds.private_key) throw new Error("incomplete");
-    return creds;
-  } catch {
-    throw new Error("Google JSON broken — re-paste full .json file in Render");
-  }
+  if (start === -1) throw new Error("Google JSON invalid");
+  return JSON.parse(text.slice(start, end + 1));
 }
 
 function googleJsonOk() {
-  try { parseGoogleCredentials(); return true; } catch { return false; }
+  try {
+    const c = parseGoogleCredentials();
+    return !!(c.client_email && c.private_key);
+  } catch { return false; }
 }
 
 app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    services: { gemini: !!process.env.GEMINI_API_KEY, googleSheets: googleJsonOk() },
-  });
+  res.json({ ok: true, services: { gemini: !!process.env.GEMINI_API_KEY, googleSheets: googleJsonOk() } });
 });
 
 function extractJson(text) {
@@ -72,18 +49,18 @@ function extractJson(text) {
   const raw = fenced ? fenced[1].trim() : String(text).trim();
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
-  if (start === -1) throw new Error("AI returned bad format");
+  if (start === -1) throw new Error("AI bad format");
   return JSON.parse(raw.slice(start, end + 1));
 }
 
 function sanitizeSheetId(input) {
-  const trimmed = (input || "").trim();
-  const match = trimmed.match(/\/d\/([a-zA-Z0-9-_]+)/);
-  return match ? match[1] : trimmed;
+  const t = (input || "").trim();
+  const m = t.match(/\/d\/([a-zA-Z0-9-_]+)/);
+  return m ? m[1] : t;
 }
 
 function norm(h) {
-  return (h || "").trim().toLowerCase();
+  return (h || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function identifyStartupName(capture) {
@@ -92,9 +69,8 @@ function identifyStartupName(capture) {
 }
 
 function getSheetsClient() {
-  const credentials = parseGoogleCredentials();
   const auth = new google.auth.GoogleAuth({
-    credentials,
+    credentials: parseGoogleCredentials(),
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
   return google.sheets({ version: "v4", auth });
@@ -102,31 +78,27 @@ function getSheetsClient() {
 
 async function getSheetHeaders(sheetId) {
   const sheets = getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId,
-    range: "Sheet1!1:1",
-  });
-  const headers = res.data.values?.[0]?.filter(Boolean);
-  if (!headers?.length) {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId,
-      range: "Sheet1!1:1",
-      valueInputOption: "RAW",
-      requestBody: { values: [DEFAULT_HEADERS] },
-    });
-    return DEFAULT_HEADERS;
-  }
-  return headers;
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range: "Sheet1!1:1" });
+  return res.data.values?.[0]?.filter((h) => h && String(h).trim()) || [];
 }
 
-function standardFieldValue(header, data) {
+// Maps normalized header → value from record
+function resolveCell(header, data) {
   const h = norm(header);
   const { record, capturedAt, sourceUrl } = data;
-  const map = {
+
+  // Direct extraFields match (exact header from sheet)
+  if (record.extraFields?.[header]) return record.extraFields[header];
+  if (record.extraFields?.[h]) return record.extraFields[h];
+
+  const aliases = {
     "captured at": capturedAt,
     "startup name": record.startupName,
     "source url": sourceUrl,
     "screenshot link": "n/a",
+    "what is the company building": record.keyProducts || record.whatIsTheCompanyBuilding,
+    "what is the company building?": record.keyProducts || record.whatIsTheCompanyBuilding,
+    "company building": record.keyProducts,
     "founding year": record.foundingYear,
     "founders": record.founders,
     "founder background": record.founderBackground,
@@ -135,92 +107,86 @@ function standardFieldValue(header, data) {
     "valuation": record.valuation,
     "arr / revenue": record.arrRevenue,
     "arr/revenue": record.arrRevenue,
+    "revenue": record.arrRevenue,
     "key products": record.keyProducts,
     "investment thesis": record.investmentThesis,
     "why they stand out": record.whyTheyStandOut,
     "competitors (startups)": record.competitorsStartups,
+    "competitors startups": record.competitorsStartups,
     "competitors (incumbents)": record.competitorsIncumbents,
+    "competitors incumbents": record.competitorsIncumbents,
     "relevant links": record.relevantLinks,
     "confidence / notes": record.confidenceNotes,
+    "confidence notes": record.confidenceNotes,
     "job status": record.jobStatus || "completed",
   };
-  return map[h] ?? record.extraFields?.[header] ?? record.extraFields?.[h] ?? "";
+
+  if (aliases[h] != null && aliases[h] !== "") return aliases[h];
+  return record.extraFields?.[header] ?? "";
 }
 
 function buildRow(headers, data) {
   return headers.map((header) => {
-    const val = standardFieldValue(header, data);
+    const val = resolveCell(header, data);
     return val == null ? "" : String(val);
   });
 }
 
-async function callGemini(prompt, useSearch = true) {
+async function callGemini(prompt) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY not set");
 
   let lastErr;
   for (const model of MODELS) {
     for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const body = {
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
-        };
-        if (useSearch) body.tools = [{ google_search: {} }];
+      for (const useSearch of [true, false]) {
+        try {
+          const body = {
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
+          };
+          if (useSearch) body.tools = [{ google_search: {} }];
 
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-        );
-        const data = await res.json();
-        if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+          const res = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+          );
+          const data = await res.json();
+          if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
 
-        const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("\n");
-        if (!text) throw new Error("Empty AI response");
-        return text;
-      } catch (err) {
-        lastErr = err;
-        const msg = err.message || "";
-        if (/503|429|high demand|not found|404|overload/i.test(msg)) {
-          await new Promise((r) => setTimeout(r, 2500 * (attempt + 1)));
-          continue;
+          const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("\n");
+          if (!text) throw new Error("Empty response");
+          console.log(`OK: ${model} search=${useSearch}`);
+          return text;
+        } catch (err) {
+          lastErr = err;
+          if (/503|429|404|not found|high demand|overload/i.test(err.message || "")) {
+            await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+          }
         }
-        break;
       }
     }
   }
-  throw lastErr || new Error("All AI models failed");
+  throw lastErr || new Error("AI failed");
 }
 
-function getCustomColumns(headers) {
-  const known = new Set([
-    "captured at", "startup name", "source url", "screenshot link",
-    "founding year", "founders", "founder background", "right to win",
-    "funding raised", "valuation", "arr / revenue", "arr/revenue",
-    "key products", "investment thesis", "why they stand out",
-    "competitors (startups)", "competitors (incumbents)",
-    "relevant links", "confidence / notes", "job status",
-  ]);
-  return headers.filter((h) => !known.has(norm(h)));
-}
+async function runWebResearch(startupName, sourceUrl, sheetHeaders) {
+  const headerList = sheetHeaders.map((h) => `"${h}"`).join(", ");
 
-async function runWebResearch(startupName, sourceUrl, customColumns = []) {
-  const queries = RESEARCH_QUERIES(startupName);
-  const customBlock = customColumns.length
-    ? `\nAlso research and fill these CUSTOM columns in "extraFields" (use exact column names as keys):\n${customColumns.map((c) => `- "${c}"`).join("\n")}`
-    : "";
+  const prompt = `You are a senior VC analyst. Research startup "${startupName}" thoroughly using Google Search.
 
-  const researchPrompt = `You are a VC research analyst. RESEARCH this startup on the web using Google Search.
+Trigger URL (hint only): ${sourceUrl}
 
-STARTUP: "${startupName}"
-Trigger URL: ${sourceUrl}
+SEARCH THE WEB for:
+- Company website, Crunchbase, TechCrunch, LinkedIn, press releases
+- Founders names, backgrounds, LinkedIn career history
+- All funding rounds, investors, valuation
+- Revenue/ARR if public
+- Product description, what they build
+- Competitors (startups + incumbents)
+- Investment thesis: why fundable?
 
-Search queries to run:
-${queries.map((q) => `- ${q}`).join("\n")}
-
-Sources: Crunchbase, TechCrunch, company website, press, LinkedIn public info, interviews.
-
-Return ONLY valid JSON:
+Return ONLY this JSON:
 {
   "startupName": "${startupName}",
   "foundingYear": "",
@@ -231,6 +197,7 @@ Return ONLY valid JSON:
   "valuation": "",
   "arrRevenue": "",
   "keyProducts": "",
+  "whatIsTheCompanyBuilding": "",
   "investmentThesis": "",
   "whyTheyStandOut": "",
   "competitorsStartups": "",
@@ -240,44 +207,45 @@ Return ONLY valid JSON:
   "jobStatus": "completed",
   "extraFields": {}
 }
-${customBlock}
 
-RULES:
-- Web search only — trigger URL is just a hint
-- Fill EVERY standard field; use "Unknown" if not findable
-- Put custom column values inside extraFields using exact column names
-- Mark estimates as (estimated)
-- jobStatus: needs_review if >3 fields uncertain
+CRITICAL RULES:
+- DO REAL WEB RESEARCH. Do NOT write "Unknown" unless you searched and found nothing.
+- If not public: write "Not publicly disclosed" NOT "Unknown"
+- If estimated: write "$50M (estimated)" format
+- founders: actual names from search
+- founderBackground: 2-3 sentences on career
+- rightToWin: why founders can win this market
+- fundingRaised: "$X Series A led by Y" format
+- investmentThesis: 2-3 compelling sentences
+- keyProducts AND whatIsTheCompanyBuilding: detailed product description
+- relevantLinks: comma-separated URLs you used
+- extraFields: fill ANY of these sheet columns not covered above, using EXACT column names as keys:
+  ${headerList}
 
-Return ONLY JSON, no markdown.`;
+jobStatus = "needs_review" only if most financial data is estimated.
 
-  let raw;
-  try {
-    raw = await callGemini(researchPrompt, true);
-  } catch {
-    raw = await callGemini(researchPrompt, false);
-  }
+Return ONLY valid JSON.`;
+
+  const raw = await callGemini(prompt);
   const record = extractJson(raw);
-  if (!record.extraFields) record.extraFields = {};
+  record.extraFields = record.extraFields || {};
+  if (!record.whatIsTheCompanyBuilding) record.whatIsTheCompanyBuilding = record.keyProducts;
+  if (!record.keyProducts) record.keyProducts = record.whatIsTheCompanyBuilding;
   return record;
 }
 
 async function appendToSheet(sheetId, data) {
   const sheets = getSheetsClient();
-  let headers;
-  try {
-    headers = await getSheetHeaders(sheetId);
-  } catch (e) {
-    throw new Error(`Cannot access Google Sheet — share with service account. ${e.message}`);
-  }
+  const headers = await getSheetHeaders(sheetId);
+  if (!headers.length) throw new Error("Sheet has no headers in row 1");
 
   const row = buildRow(headers, data);
-  const colEnd = String.fromCharCode(64 + Math.min(headers.length, 26));
-  const range = headers.length <= 26 ? `Sheet1!A:${colEnd}` : `Sheet1!A1`;
+  console.log("Headers:", headers);
+  console.log("Row:", row);
 
   const response = await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: headers.length <= 26 ? `Sheet1!A:${colEnd}` : "Sheet1!A:ZZ",
+    range: "Sheet1!A:ZZ",
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
     requestBody: { values: [row] },
@@ -291,13 +259,13 @@ async function appendToSheet(sheetId, data) {
 async function processJob(jobId, capture, sheetId) {
   try {
     const startupName = identifyStartupName(capture);
+    const headers = await getSheetHeaders(sheetId);
+
     jobs.set(jobId, { id: jobId, status: "processing", progress: `Researching ${startupName}...`, startupName });
 
-    const headers = await getSheetHeaders(sheetId);
-    const customColumns = getCustomColumns(headers);
-    const record = await runWebResearch(startupName, capture.pageContext?.url || "", customColumns);
+    const record = await runWebResearch(startupName, capture.pageContext?.url || "", headers);
 
-    jobs.set(jobId, { ...jobs.get(jobId), progress: "Saving to Google Sheet..." });
+    jobs.set(jobId, { ...jobs.get(jobId), progress: "Saving..." });
 
     const { sheetUrl } = await appendToSheet(sheetId, {
       capturedAt: capture.capturedAt,
@@ -314,17 +282,17 @@ async function processJob(jobId, capture, sheetId) {
     });
   } catch (err) {
     console.error("Job failed:", err);
-    jobs.set(jobId, { id: jobId, status: "failed", error: err.message || "Unknown error" });
+    jobs.set(jobId, { id: jobId, status: "failed", error: err.message });
   }
 }
 
 app.post("/api/capture", (req, res) => {
   const body = req.body;
   if (!body.pageContext?.companyNameHint && !body.pageContext?.title) {
-    return res.status(400).json({ error: "Could not identify startup name from page" });
+    return res.status(400).json({ error: "Could not identify startup name" });
   }
   const sheetId = sanitizeSheetId(body.sheetId || process.env.GOOGLE_SHEET_ID);
-  if (!sheetId) return res.status(400).json({ error: "No Google Sheet ID configured" });
+  if (!sheetId) return res.status(400).json({ error: "No Sheet ID" });
 
   const jobId = uuidv4();
   jobs.set(jobId, { id: jobId, status: "queued" });
@@ -334,7 +302,7 @@ app.post("/api/capture", (req, res) => {
 
 app.get("/api/jobs/:jobId", (req, res) => {
   const job = jobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: "Job not found" });
+  if (!job) return res.status(404).json({ error: "Not found" });
   res.json({
     jobId: job.id, status: job.status, startupName: job.startupName,
     sheetRowUrl: job.sheetRowUrl, error: job.error, progress: job.progress,
