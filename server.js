@@ -7,7 +7,7 @@ import { google } from "googleapis";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const MODEL = "gemini-2.5-flash";
+const MODEL = "gemini-3.6-flash";
 
 const SHEET_COLUMNS = [
   "Captured At", "Startup Name", "Source URL", "Screenshot Link",
