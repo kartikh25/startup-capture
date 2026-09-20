@@ -14,7 +14,7 @@ const MODELS = [
   "gemini-2.0-flash-lite",
 ];
 
-const SHEET_COLUMNS = [
+const DEFAULT_HEADERS = [
   "Captured At", "Startup Name", "Source URL", "Screenshot Link",
   "Founding Year", "Founders", "Founder Background", "Right to Win",
   "Funding Raised", "Valuation", "ARR / Revenue", "Key Products",
@@ -22,7 +22,7 @@ const SHEET_COLUMNS = [
   "Competitors (Incumbents)", "Relevant Links", "Confidence / Notes", "Job Status",
 ];
 
-const RESEARCH_QUERIES = (name, url) => [
+const RESEARCH_QUERIES = (name) => [
   `"${name}" startup founders CEO background LinkedIn`,
   `"${name}" funding raised valuation investors crunchbase`,
   `"${name}" revenue ARR annual recurring revenue`,
@@ -82,13 +82,76 @@ function sanitizeSheetId(input) {
   return match ? match[1] : trimmed;
 }
 
+function norm(h) {
+  return (h || "").trim().toLowerCase();
+}
+
 function identifyStartupName(capture) {
   const pc = capture.pageContext || {};
-  return (
-    pc.companyNameHint ||
-    pc.title?.split("|")[0]?.split("-")[0]?.trim() ||
-    "Unknown Startup"
-  );
+  return pc.companyNameHint || pc.title?.split("|")[0]?.split("-")[0]?.trim() || "Unknown Startup";
+}
+
+function getSheetsClient() {
+  const credentials = parseGoogleCredentials();
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
+  return google.sheets({ version: "v4", auth });
+}
+
+async function getSheetHeaders(sheetId) {
+  const sheets = getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: "Sheet1!1:1",
+  });
+  const headers = res.data.values?.[0]?.filter(Boolean);
+  if (!headers?.length) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: "Sheet1!1:1",
+      valueInputOption: "RAW",
+      requestBody: { values: [DEFAULT_HEADERS] },
+    });
+    return DEFAULT_HEADERS;
+  }
+  return headers;
+}
+
+function standardFieldValue(header, data) {
+  const h = norm(header);
+  const { record, capturedAt, sourceUrl } = data;
+  const map = {
+    "captured at": capturedAt,
+    "startup name": record.startupName,
+    "source url": sourceUrl,
+    "screenshot link": "n/a",
+    "founding year": record.foundingYear,
+    "founders": record.founders,
+    "founder background": record.founderBackground,
+    "right to win": record.rightToWin,
+    "funding raised": record.fundingRaised,
+    "valuation": record.valuation,
+    "arr / revenue": record.arrRevenue,
+    "arr/revenue": record.arrRevenue,
+    "key products": record.keyProducts,
+    "investment thesis": record.investmentThesis,
+    "why they stand out": record.whyTheyStandOut,
+    "competitors (startups)": record.competitorsStartups,
+    "competitors (incumbents)": record.competitorsIncumbents,
+    "relevant links": record.relevantLinks,
+    "confidence / notes": record.confidenceNotes,
+    "job status": record.jobStatus || "completed",
+  };
+  return map[h] ?? record.extraFields?.[header] ?? record.extraFields?.[h] ?? "";
+}
+
+function buildRow(headers, data) {
+  return headers.map((header) => {
+    const val = standardFieldValue(header, data);
+    return val == null ? "" : String(val);
+  });
 }
 
 async function callGemini(prompt, useSearch = true) {
@@ -114,13 +177,11 @@ async function callGemini(prompt, useSearch = true) {
 
         const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join("\n");
         if (!text) throw new Error("Empty AI response");
-        console.log(`Research OK via ${model}`);
         return text;
       } catch (err) {
         lastErr = err;
         const msg = err.message || "";
-        const retry = /503|429|high demand|not found|404|overload/i.test(msg);
-        if (retry) {
+        if (/503|429|high demand|not found|404|overload/i.test(msg)) {
           await new Promise((r) => setTimeout(r, 2500 * (attempt + 1)));
           continue;
         }
@@ -131,19 +192,35 @@ async function callGemini(prompt, useSearch = true) {
   throw lastErr || new Error("All AI models failed");
 }
 
-async function runWebResearch(startupName, sourceUrl) {
-  const queries = RESEARCH_QUERIES(startupName, sourceUrl);
-  const researchPrompt = `You are a VC research analyst. Your job is to RESEARCH a startup on the web — do NOT rely on any page scrape.
+function getCustomColumns(headers) {
+  const known = new Set([
+    "captured at", "startup name", "source url", "screenshot link",
+    "founding year", "founders", "founder background", "right to win",
+    "funding raised", "valuation", "arr / revenue", "arr/revenue",
+    "key products", "investment thesis", "why they stand out",
+    "competitors (startups)", "competitors (incumbents)",
+    "relevant links", "confidence / notes", "job status",
+  ]);
+  return headers.filter((h) => !known.has(norm(h)));
+}
 
-STARTUP TO RESEARCH: "${startupName}"
-Trigger URL (where user found it): ${sourceUrl}
+async function runWebResearch(startupName, sourceUrl, customColumns = []) {
+  const queries = RESEARCH_QUERIES(startupName);
+  const customBlock = customColumns.length
+    ? `\nAlso research and fill these CUSTOM columns in "extraFields" (use exact column names as keys):\n${customColumns.map((c) => `- "${c}"`).join("\n")}`
+    : "";
 
-Use Google Search extensively. Run searches like:
+  const researchPrompt = `You are a VC research analyst. RESEARCH this startup on the web using Google Search.
+
+STARTUP: "${startupName}"
+Trigger URL: ${sourceUrl}
+
+Search queries to run:
 ${queries.map((q) => `- ${q}`).join("\n")}
 
-Find from PUBLIC sources: Crunchbase, TechCrunch, company website, press releases, LinkedIn public profiles, interviews, Twitter/X.
+Sources: Crunchbase, TechCrunch, company website, press, LinkedIn public info, interviews.
 
-After researching, return ONLY this JSON (fill EVERY field — use "Unknown" only if truly not findable after search):
+Return ONLY valid JSON:
 {
   "startupName": "${startupName}",
   "foundingYear": "",
@@ -160,25 +237,19 @@ After researching, return ONLY this JSON (fill EVERY field — use "Unknown" onl
   "competitorsIncumbents": "",
   "relevantLinks": "",
   "confidenceNotes": "",
-  "jobStatus": "completed"
+  "jobStatus": "completed",
+  "extraFields": {}
 }
+${customBlock}
 
 RULES:
-- DO YOUR OWN RESEARCH via web search. The trigger URL is just a hint — search the whole web.
-- founders: full names, comma-separated
-- founderBackground: career history, education, prior companies
-- rightToWin: why these founders can win based on their track record
-- fundingRaised: all known rounds, amounts, lead investors
-- valuation: latest known or (estimated) with note
-- arrRevenue: if not public, write "Not publicly disclosed" or best estimate marked (estimated)
-- investmentThesis: 2-3 sentence VC investment case
-- whyTheyStandOut: differentiation, traction signals
-- competitorsStartups + competitorsIncumbents: comma-separated names
-- relevantLinks: comma-separated source URLs you actually used
-- confidenceNotes: flag anything uncertain or conflicting
-- jobStatus: "needs_review" if >3 fields are estimated/unknown
+- Web search only — trigger URL is just a hint
+- Fill EVERY standard field; use "Unknown" if not findable
+- Put custom column values inside extraFields using exact column names
+- Mark estimates as (estimated)
+- jobStatus: needs_review if >3 fields uncertain
 
-Return ONLY valid JSON, no markdown.`;
+Return ONLY JSON, no markdown.`;
 
   let raw;
   try {
@@ -186,49 +257,29 @@ Return ONLY valid JSON, no markdown.`;
   } catch {
     raw = await callGemini(researchPrompt, false);
   }
-  return extractJson(raw);
-}
-
-function getSheetsClient() {
-  const credentials = parseGoogleCredentials();
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-  });
-  return google.sheets({ version: "v4", auth });
+  const record = extractJson(raw);
+  if (!record.extraFields) record.extraFields = {};
+  return record;
 }
 
 async function appendToSheet(sheetId, data) {
   const sheets = getSheetsClient();
-  const { record, capturedAt, sourceUrl } = data;
-
+  let headers;
   try {
-    const existing = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId, range: "Sheet1!A1:S1",
-    });
-    if (!existing.data.values?.length) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: sheetId, range: "Sheet1!A1:S1",
-        valueInputOption: "RAW", requestBody: { values: [SHEET_COLUMNS] },
-      });
-    }
+    headers = await getSheetHeaders(sheetId);
   } catch (e) {
     throw new Error(`Cannot access Google Sheet — share with service account. ${e.message}`);
   }
 
-  const row = [
-    capturedAt, record.startupName, sourceUrl, "n/a",
-    record.foundingYear || "", record.founders || "", record.founderBackground || "",
-    record.rightToWin || "", record.fundingRaised || "", record.valuation || "",
-    record.arrRevenue || "", record.keyProducts || "", record.investmentThesis || "",
-    record.whyTheyStandOut || "", record.competitorsStartups || "",
-    record.competitorsIncumbents || "", record.relevantLinks || "",
-    record.confidenceNotes || "", record.jobStatus || "completed",
-  ];
+  const row = buildRow(headers, data);
+  const colEnd = String.fromCharCode(64 + Math.min(headers.length, 26));
+  const range = headers.length <= 26 ? `Sheet1!A:${colEnd}` : `Sheet1!A1`;
 
   const response = await sheets.spreadsheets.values.append({
-    spreadsheetId: sheetId, range: "Sheet1!A:S",
-    valueInputOption: "USER_ENTERED", insertDataOption: "INSERT_ROWS",
+    spreadsheetId: sheetId,
+    range: headers.length <= 26 ? `Sheet1!A:${colEnd}` : "Sheet1!A:ZZ",
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "INSERT_ROWS",
     requestBody: { values: [row] },
   });
 
@@ -240,9 +291,11 @@ async function appendToSheet(sheetId, data) {
 async function processJob(jobId, capture, sheetId) {
   try {
     const startupName = identifyStartupName(capture);
-    jobs.set(jobId, { id: jobId, status: "processing", progress: `Researching ${startupName} on the web...`, startupName });
+    jobs.set(jobId, { id: jobId, status: "processing", progress: `Researching ${startupName}...`, startupName });
 
-    const record = await runWebResearch(startupName, capture.pageContext?.url || "");
+    const headers = await getSheetHeaders(sheetId);
+    const customColumns = getCustomColumns(headers);
+    const record = await runWebResearch(startupName, capture.pageContext?.url || "", customColumns);
 
     jobs.set(jobId, { ...jobs.get(jobId), progress: "Saving to Google Sheet..." });
 
